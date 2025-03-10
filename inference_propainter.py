@@ -175,8 +175,8 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 
 
 if __name__ == '__main__':
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = get_device()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -208,7 +208,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
     parser.add_argument(
-        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
+        '--save_fps', type=int, default=30, help='Frame per second. Default: 24')
     parser.add_argument(
         '--save_frames', action='store_true', help='Save output frames. Default: False')
     parser.add_argument(
