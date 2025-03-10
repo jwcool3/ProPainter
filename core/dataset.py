@@ -13,14 +13,18 @@ from utils.file_client import FileClient
 from utils.img_util import imfrombytes
 from utils.flow_util import resize_flow, flowread
 from core.utils import (create_random_shape_with_random_motion, Stack,
-                        ToTorchFormatTensor, GroupRandomHorizontalFlip,GroupRandomHorizontalFlowFlip)
+                        ToTorchFormatTensor, GroupRandomHorizontalFlip, GroupRandomHorizontalFlowFlip)
+
+from torch.utils.data import Dataset
+from pathlib import Path
 
 
-class TrainDataset(torch.utils.data.Dataset):
+class TrainDataset(Dataset):
     def __init__(self, args: dict):
         self.args = args
-        self.video_root = args['video_root']
-        self.flow_root = args['flow_root']
+        self.video_root = Path(args['video_root']).resolve()
+        self.flow_root = Path(args['flow_root']).resolve()
+
         self.num_local_frames = args['num_local_frames']
         self.num_ref_frames = args['num_ref_frames']
         self.size = self.w, self.h = (args['w'], args['h'])
@@ -29,25 +33,25 @@ class TrainDataset(torch.utils.data.Dataset):
         if self.load_flow:
             assert os.path.exists(self.flow_root)
         
-        json_path = os.path.join('./datasets', args['name'], 'train.json')
+        json_path = args.get('json_path', Path('datasets') / args['name'] / 'train.json')
 
         with open(json_path, 'r') as f:
             self.video_train_dict = json.load(f)
         self.video_names = sorted(list(self.video_train_dict.keys()))
 
-        # self.video_names = sorted(os.listdir(self.video_root))
         self.video_dict = {}
         self.frame_dict = {}
 
         for v in self.video_names:
-            frame_list = sorted(os.listdir(os.path.join(self.video_root, v)))
+            path_to_video = Path(self.video_root) / v
+            if not path_to_video.exists():
+                raise FileNotFoundError(f"Directory not found: {path_to_video}")
+
+            frame_list = sorted(os.listdir(str(path_to_video)))  # Convert Path object to string for os.listdir()
             v_len = len(frame_list)
             if v_len > self.num_local_frames + self.num_ref_frames:
                 self.video_dict[v] = v_len
                 self.frame_dict[v] = frame_list
-                
-
-        self.video_names = list(self.video_dict.keys()) # update names
 
         self._to_tensors = transforms.Compose([
             Stack(),
@@ -58,14 +62,21 @@ class TrainDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.video_names)
 
-    def _sample_index(self, length, sample_length, num_ref_frame=3):
-        complete_idx_set = list(range(length))
-        pivot = random.randint(0, length - sample_length)
-        local_idx = complete_idx_set[pivot:pivot + sample_length]
-        remain_idx = list(set(complete_idx_set) - set(local_idx))
-        ref_index = sorted(random.sample(remain_idx, num_ref_frame))
+    def _sample_index(self, video_length, num_local_frames, num_ref_frames):
+        """
+        Generate a list of indices for sampling frames from the video.
+        """
+        max_start = video_length - (num_local_frames + num_ref_frames)
+        if max_start < 0:
+            raise ValueError(f"Not enough frames in video. Available: {video_length}, Required: {num_local_frames + num_ref_frames}")
 
-        return local_idx + ref_index
+        start_idx = random.randint(0, max_start)
+        local_indices = list(range(start_idx, start_idx + num_local_frames))
+        ref_indices = random.sample(range(video_length), num_ref_frames)
+
+        return local_indices + ref_indices
+
+
 
     def __getitem__(self, index):
         video_name = self.video_names[index]
@@ -84,8 +95,9 @@ class TrainDataset(torch.utils.data.Dataset):
         flows_f, flows_b = [], []
         for idx in selected_index:
             frame_list = self.frame_dict[video_name]
-            img_path = os.path.join(self.video_root, video_name, frame_list[idx])
-            img_bytes = self.file_client.get(img_path, 'img')
+            img_path = Path(self.video_root) / video_name / frame_list[idx]
+            img_bytes = self.file_client.get(str(img_path), 'img')
+
             img = imfrombytes(img_bytes, float32=False)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, self.size, interpolation=cv2.INTER_LINEAR)
@@ -122,7 +134,7 @@ class TrainDataset(torch.utils.data.Dataset):
         else:
             frames = GroupRandomHorizontalFlip()(frames)
 
-        # normalizate, to tensors
+        # normalize, to tensors
         frame_tensors = self._to_tensors(frames) * 2.0 - 1.0
         mask_tensors = self._to_tensors(masks)
         if self.load_flow:
@@ -156,7 +168,8 @@ class TestDataset(torch.utils.data.Dataset):
         self.frame_dict = {}
 
         for v in self.video_names:
-            frame_list = sorted(os.listdir(os.path.join(self.video_root, v)))
+            frame_list = sorted(os.listdir(Path(self.video_root) / v))
+
             v_len = len(frame_list)
             self.video_dict[v] = v_len
             self.frame_dict[v] = frame_list
@@ -215,7 +228,7 @@ class TestDataset(torch.utils.data.Dataset):
                 flows_f.append(flow_f)
                 flows_b.append(flow_b)
 
-        # normalizate, to tensors
+        # normalize, to tensors
         frames_PIL = [np.array(f).astype(np.uint8) for f in frames]
         frame_tensors = self._to_tensors(frames) * 2.0 - 1.0
         mask_tensors = self._to_tensors(masks)
@@ -230,3 +243,4 @@ class TestDataset(torch.utils.data.Dataset):
             return frame_tensors, mask_tensors, flows_f, flows_b, video_name, frames_PIL
         else:
             return frame_tensors, mask_tensors, 'None', 'None', video_name
+        
