@@ -3,7 +3,7 @@ import glob
 import logging
 import importlib
 from tqdm import tqdm
-
+from torch.cuda.amp import GradScaler, autocast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,7 +30,7 @@ class Trainer:
         self.iteration = 0
         self.num_local_frames = config['train_data_loader']['num_local_frames']
         self.num_ref_frames = config['train_data_loader']['num_ref_frames']
-
+        self.scaler = GradScaler()  # Initialize GradScaler for mixed precision training
         # setup data set and data loader
         self.train_dataset = TrainDataset(config['train_data_loader'])
 
@@ -72,7 +72,7 @@ class Trainer:
 
         # set raft
         self.fix_raft = RAFT_bi(device = self.config['device'])
-        self.fix_flow_complete = RecurrentFlowCompleteNet('weights/recurrent_flow_completion.pth')
+        self.fix_flow_complete = RecurrentFlowCompleteNet('/home/weights/recurrent_flow_completion.pth')
         for p in self.fix_flow_complete.parameters():
             p.requires_grad = False
         self.fix_flow_complete.to(self.config['device'])
@@ -374,7 +374,8 @@ class Trainer:
             # pred_flows_bi = gt_flows_bi
 
             # ---- image propagation ----
-            prop_imgs, updated_local_masks = self.netG.module.img_propagation(masked_local_frames, pred_flows_bi, local_masks, interpolation=self.interp_mode)
+            netG = self.netG.module if isinstance(self.netG, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else self.netG
+            prop_imgs, updated_local_masks = netG.img_propagation(masked_local_frames, pred_flows_bi, local_masks, interpolation=self.interp_mode)
             updated_masks = masks.clone()
             updated_masks[:, :l_t, ...] = updated_local_masks.view(b, l_t, 1, h, w)
             updated_frames = masked_frames.clone()
@@ -382,50 +383,57 @@ class Trainer:
             updated_frames[:, :l_t, ...] = prop_local_frames
 
             # ---- feature propagation + Transformer ----
-            pred_imgs = self.netG(updated_frames, pred_flows_bi, masks, updated_masks, l_t)
-            pred_imgs = pred_imgs.view(b, -1, c, h, w)
+            with autocast():  # Enable mixed precision training
+                pred_imgs = self.netG(updated_frames, pred_flows_bi, masks, updated_masks, l_t)
+                pred_imgs = pred_imgs.view(b, -1, c, h, w)
 
-            # get the local frames
-            pred_local_frames = pred_imgs[:, :l_t, ...]
-            comp_local_frames = gt_local_frames * (1. - local_masks) +  pred_local_frames * local_masks
-            comp_imgs = frames * (1. - masks) + pred_imgs * masks
+                # get the local frames
+                pred_local_frames = pred_imgs[:, :l_t, ...]
+                comp_local_frames = gt_local_frames * (1. - local_masks) +  pred_local_frames * local_masks
+                comp_imgs = frames * (1. - masks) + pred_imgs * masks
 
-            gen_loss = 0
-            dis_loss = 0
-            # optimize net_g
-            if not self.config['model']['no_dis']:
-                for p in self.netD.parameters():
-                    p.requires_grad = False
+                gen_loss = 0
+                dis_loss = 0
+                # optimize net_g
+                if not self.config['model']['no_dis']:
+                    for p in self.netD.parameters():
+                        p.requires_grad = False
 
-            self.optimG.zero_grad()
+                self.optimG.zero_grad()
 
-            # generator l1 loss
-            hole_loss = self.l1_loss(pred_imgs * masks, frames * masks)
-            hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']
-            gen_loss += hole_loss
-            self.add_summary(self.gen_writer, 'loss/hole_loss', hole_loss.item())
+                # generator l1 loss
+                hole_loss = self.l1_loss(pred_imgs * masks, frames * masks)
+                hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']
+                gen_loss += hole_loss
+                self.add_summary(self.gen_writer, 'loss/hole_loss', hole_loss.item())
 
-            valid_loss = self.l1_loss(pred_imgs * (1 - masks), frames * (1 - masks))
-            valid_loss = valid_loss / torch.mean(1-masks) * self.config['losses']['valid_weight']
-            gen_loss += valid_loss
-            self.add_summary(self.gen_writer, 'loss/valid_loss', valid_loss.item())
+                valid_loss = self.l1_loss(pred_imgs * (1 - masks), frames * (1 - masks))
+                valid_loss = valid_loss / torch.mean(1-masks) * self.config['losses']['valid_weight']
+                gen_loss += valid_loss
+                self.add_summary(self.gen_writer, 'loss/valid_loss', valid_loss.item())
 
-            # perceptual loss
-            if self.config['losses']['perceptual_weight'] > 0:
-                perc_loss = self.perc_loss(pred_imgs.view(-1,3,h,w), frames.view(-1,3,h,w))[0] * self.config['losses']['perceptual_weight']
-                gen_loss += perc_loss
-                self.add_summary(self.gen_writer, 'loss/perc_loss', perc_loss.item())
+                # perceptual loss
+                if self.config['losses']['perceptual_weight'] > 0:
+                    perc_loss = self.perc_loss(pred_imgs.view(-1,3,h,w), frames.view(-1,3,h,w))[0] * self.config['losses']['perceptual_weight']
+                    gen_loss += perc_loss
+                    self.add_summary(self.gen_writer, 'loss/perc_loss', perc_loss.item())
 
-            # gan loss
-            if not self.config['model']['no_dis']:
-                # generator adversarial loss
-                gen_clip = self.netD(comp_imgs)
-                gan_loss = self.adversarial_loss(gen_clip, True, False)
-                gan_loss = gan_loss * self.config['losses']['adversarial_weight']
-                gen_loss += gan_loss
-                self.add_summary(self.gen_writer, 'loss/gan_loss', gan_loss.item())
-            gen_loss.backward()
+                # gan loss
+                if not self.config['model']['no_dis']:
+                    # generator adversarial loss
+                    gen_clip = self.netD(comp_imgs)
+                    gan_loss = self.adversarial_loss(gen_clip, True, False)
+                    gan_loss = gan_loss * self.config['losses']['adversarial_weight']
+                    gen_loss += gan_loss
+                    self.add_summary(self.gen_writer, 'loss/gan_loss', gan_loss.item())
+
+            self.scaler.scale(gen_loss).backward()  # Scale the loss for mixed precision training
+            self.scaler.step(self.optimG)  # Step the optimizer
+            self.scaler.update()  # Update the scaler
+
+            # Add the optimizer step and scheduler step here
             self.optimG.step()
+            self.scheG.step()
 
             if not self.config['model']['no_dis']:
                 # optimize net_d
@@ -482,22 +490,22 @@ class Trainer:
                 pbar.update(1)
                 if not self.config['model']['no_dis']:
                     pbar.set_description((f"d: {dis_loss.item():.3f}; "
-                                          f"hole: {hole_loss.item():.3f}; "
-                                          f"valid: {valid_loss.item():.3f}"))
+                                        f"hole: {hole_loss.item():.3f}; "
+                                        f"valid: {valid_loss.item():.3f}"))
                 else:
                     pbar.set_description((f"hole: {hole_loss.item():.3f}; "
-                                          f"valid: {valid_loss.item():.3f}"))
+                                        f"valid: {valid_loss.item():.3f}"))
 
                 if self.iteration % self.train_args['log_freq'] == 0:
                     if not self.config['model']['no_dis']:
                         logging.info(f"[Iter {self.iteration}] "
-                                     f"d: {dis_loss.item():.4f}; "
-                                     f"hole: {hole_loss.item():.4f}; "
-                                     f"valid: {valid_loss.item():.4f}")
+                                    f"d: {dis_loss.item():.4f}; "
+                                    f"hole: {hole_loss.item():.4f}; "
+                                    f"valid: {valid_loss.item():.4f}")
                     else:
                         logging.info(f"[Iter {self.iteration}] "
-                                     f"hole: {hole_loss.item():.4f}; "
-                                     f"valid: {valid_loss.item():.4f}")
+                                    f"hole: {hole_loss.item():.4f}; "
+                                    f"valid: {valid_loss.item():.4f}")
 
             # saving models
             if self.iteration % self.train_args['save_freq'] == 0:
