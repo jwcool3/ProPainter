@@ -29,13 +29,14 @@ def initialize_RAFT(model_path='weights/raft-things.pth', device='cuda'):
     args.alternate_corr = False
 
     model = torch.nn.DataParallel(RAFT(args))
-    model.load_state_dict(torch.load(args.raft_model))
+    model.load_state_dict(torch.load(args.raft_model, map_location=device))  # Ensure model is loaded to the correct device
 
     model = model.module
     model.to(device)
     model.eval()
 
     return model
+
 
 
 if __name__ == '__main__':
@@ -98,8 +99,8 @@ if __name__ == '__main__':
             flow_f = flow_f[0].permute(1,2,0).cpu().numpy()
             flow_b = flow_b[0].permute(1,2,0).cpu().numpy()
 
-            # flow_f = resize_flow(flow_f, h_new, w_new)
-            # flow_b = resize_flow(flow_b, h_new, w_new)
+            # flow_f = resize_flow(flow_f, w_new, h_new)
+            # flow_b = resize_flow(flow_b, w_new, h_new)
 
             save_flow_f = os.path.join(save_path, f, f'{m_list[i][:-4]}_{m_list[i+1][:-4]}_f.flo')
             save_flow_b = os.path.join(save_path, f, f'{m_list[i+1][:-4]}_{m_list[i][:-4]}_b.flo')
