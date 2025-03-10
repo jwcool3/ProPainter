@@ -14,7 +14,8 @@ from matplotlib.path import Path
 from matplotlib import pyplot as plt
 from torchvision import transforms
 
-# matplotlib.use('agg')
+matplotlib.use('Agg')  # Use the Agg backend for non-interactive plotting
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 # ###########################################################################
 # Directory IO
@@ -285,6 +286,7 @@ def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):
     path = Path(verts, codes)
     # draw paths into images
     fig = plt.figure()
+    canvas = FigureCanvas(fig)
     ax = fig.add_subplot(111)
     patch = patches.PathPatch(path, facecolor='black', lw=2)
     ax.add_patch(patch)
@@ -293,7 +295,18 @@ def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):
     ax.axis('off')  # removes the axis to leave only the shape
     fig.canvas.draw()
     # convert plt images into numpy images
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    buffer, _ = fig.canvas.print_to_buffer()
+    w, h = fig.canvas.get_width_height()
+    expected_size = w * h * 4  # print_to_buffer() returns 4 channels (RGBA)
+
+    if len(buffer) == expected_size:
+        data = np.frombuffer(buffer, dtype=np.uint8).reshape((h, w, 4))[:, :, :3]  # Discard alpha channel
+    else:
+        raise ValueError(f"Buffer size mismatch: {len(buffer)} vs expected {expected_size}")
+
+
+
+
     data = data.reshape((fig.canvas.get_width_height()[::-1] + (3,)))
     plt.close(fig)
     # postprocess
